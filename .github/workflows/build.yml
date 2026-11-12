@@ -1,60 +1,30 @@
-name: build-driver
-
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install WDK
+- name: Install WDK
         shell: pwsh
         run: |
-          Write-Host "Downloading WDK installer..."
+          Write-Host "Downloading WDK installer via curl..."
           $url = "https://go.microsoft.com/fwlink/?linkid=2307563"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\wdksetup.exe"
-          
+          $out = "$env:TEMP\wdksetup.exe"
+
+          curl.exe -L -f -o $out $url
+          if ($LASTEXITCODE -ne 0) { throw "curl failed with code $LASTEXITCODE" }
+
+          if (-not (Test-Path $out)) { throw "file not downloaded" }
+          $size = (Get-Item $out).Length
+          Write-Host "Downloaded size: $size bytes"
+
+          $bytes = [System.IO.File]::ReadAllBytes($out)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+              Write-Host "First bytes: $($bytes[0..10] | ForEach-Object { $_.ToString('X2') })"
+              throw "Downloaded file is not a PE executable (not MZ)"
+          }
+          Write-Host "File is a valid PE executable"
+
           Write-Host "Installing WDK..."
-          Start-Process -FilePath "$env:TEMP\wdksetup.exe" -ArgumentList "/quiet", "/norestart", "/features +" -Wait -NoNewWindow
-          
+          $p = Start-Process -FilePath $out -ArgumentList "/quiet", "/norestart", "/features +" -Wait -PassThru -NoNewWindow
+          Write-Host "Installer exit code: $($p.ExitCode)"
+
           $km = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Directory |
                 Where-Object { Test-Path (Join-Path $_.FullName "km\ntddk.h") } |
                 Sort-Object Name -Descending | Select-Object -First 1
           if (-not $km) { throw "WDK install failed: no km\ntddk.h" }
           Write-Host "WDK headers at: $($km.FullName)"
-          $Global:WDKVER = $km.Name
-
-      - name: Build driver
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          for /f "delims=" %%i in ('dir /b /ad /o-n "C:\Program Files (x86)\Windows Kits\10\Include" ^| findstr /r "^10\."') do (
-              if exist "C:\Program Files (x86)\Windows Kits\10\Include\%%i\km\ntddk.h" (
-                  set WDKVER=%%i
-                  goto :found
-              )
-          )
-          :found
-          echo Using WDK: %WDKVER%
-          cl /nologo /kernel /GS- /O2 /W3 /c NvRmDrv.c ^
-             /Fo:NvRmDrv.obj ^
-             /I"C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\km" ^
-             /I"C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\shared" ^
-             /I"C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\ucrt"
-          if errorlevel 1 exit /b 1
-          link /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
-             /OUT:NvRmDrv.sys NvRmDrv.obj ^
-             /LIBPATH:"C:\Program Files (x86)\Windows Kits\10\Lib\%WDKVER%\km\x64" ^
-             ntoskrnl.lib hal.lib ntstrsafe.lib
-          if errorlevel 1 exit /b 1
-          dir NvRmDrv.sys
-
-      - name: Upload driver
-        uses: actions/upload-artifact@v4
-        with:
-          name: NvRmDrv
-          path: NvRmDrv.sys
